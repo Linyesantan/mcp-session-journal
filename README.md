@@ -59,6 +59,19 @@ python3 examples/http_mcp_proxy.py
 
 ---
 
+## 无状态客户端的会话粘连（sticky sessions）
+
+很多客户端（如每次调用都新建连接、不回传 `Mcp-Session-Id` 的代理）会让每次调用都变成一个一步会话。journal 按**客户端指纹**把它们续接起来：
+
+- 指纹优先取**客户端标签**：`/mcp/<token>/<label>`、`X-MCP-Client: <label>` 或 `?client=<label>`（`[A-Za-z0-9._-]{1,40}`，不区分大小写，同一个库内全局共享）。标签非法、重复或互相冲突时直接拒绝请求，不会悄悄退回。没有标签时用 IP + User-Agent；转发 IP 头只在 TCP 对端是回环地址（本地隧道）时才采信。
+- 同指纹的新连接在空闲窗口内（`MCP_JOURNAL_STICKY_SECONDS`，默认 7200）续接该指纹上次使用的活跃会话；不带会话头但有指纹的调用各自开新会话，不再共用 `default`。
+- 解析、建行、写链接在同一个 `BEGIN IMMEDIATE` 事务里完成，并发首调和多进程共享库都不会分裂或写出矛盾绑定。
+- `resume` 绑定当前连接与指纹；`resume session_id=new` 总是新建会话；`task_note status=done` 会解除指向该会话的所有绑定和粘连，旧连接之后自动换到新会话。
+- 显式 `session_id` / `_journal_session` 只作用于本次调用，不改粘连；普通调用也不会把客户端已切走的粘连拉回旧会话。
+- 同一标签下并行跑多个任务会合并，请为每个任务用 `_journal_session` 或不同标签。
+- `list_sessions` 默认隐藏一步、无标题、无交接内容的会话（`include_trivial=true` 显示）。
+- 访问日志只记录方法、路由类别和状态码，不记录路径和查询串。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -67,6 +80,7 @@ python3 examples/http_mcp_proxy.py
 | `MCP_JOURNAL_RETENTION_DAYS` | `14` | 自动清理超过 N 天未更新的旧会话 |
 | `MCP_JOURNAL_MAX_EVENTS` | `500` | 单会话保留的最大黑匣子事件条数 |
 | `MCP_JOURNAL_MAX_SESSIONS` | `200` | 最多保留的会话总数 |
+| `MCP_JOURNAL_STICKY_SECONDS` | `7200` | 同客户端指纹续接会话的空闲窗口（秒），`0` 关闭粘连 |
 
 ---
 
@@ -87,3 +101,4 @@ python3 -m unittest discover -s tests -v
 ## License
 
 MIT
+

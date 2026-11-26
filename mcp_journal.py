@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-session black-box journal & handoff helper for MCP servers.
+"""Multi-session black-box journal & handoff helper for Termux MCP servers.
 
 Stdlib-only (SQLite WAL), multi-process safe, zero external dependencies.
 Provides:
@@ -10,6 +10,7 @@ Provides:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 DEFAULT_ROOT = Path(
     os.environ.get("MCP_JOURNAL_DIR", str(Path.home() / ".local/state/mcp-sessions"))
@@ -35,6 +37,114 @@ META_SESSION_KEY = "_journal_session"
 JOURNAL_TOOL_NAMES = {"list_sessions", "resume", "task_note", "append_summary"}
 SHELL_TOOLS = {"run", "rish", "termux_shell", "termux_api"}
 MAX_SUMMARY_FILE_BYTES = 128 * 1024
+# Stateless clients (one HTTP connection / initialize per tool call) get a fresh Mcp-Session-Id
+# every call. Within this idle window, a new connection from the same client fingerprint
+# continues the session that fingerprint last used instead of starting a one-step session.
+STICKY_SECONDS = int(os.environ.get("MCP_JOURNAL_STICKY_SECONDS", "7200"))
+NEW_SESSION_WORDS = {"new", "fresh", "none"}
+
+
+def client_fingerprint(*parts: Any) -> str:
+    raw = "|".join(str(p or "").strip().lower() for p in parts)
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:20]
+
+
+# Client labels are case-insensitive (normalised to lower case) and global to one journal DB:
+# every client configured with the same label shares sticky sessions.
+LABEL_RE = re.compile(r"^(?!\.{1,2}$)[A-Za-z0-9._-]{1,40}$")
+LOOPBACK_ADDRS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+
+
+class RouteError(ValueError):
+    """Malformed MCP route or client label; the server should answer 400."""
+
+
+def parse_mcp_route(raw_path: str, headers: Any = None, prefix: str = "mcp") -> tuple[str, str]:
+    """Strictly parse `/<prefix>[/<token>[/<label>]][?client=<label>]`.
+
+    Returns (path_token, label). No percent-encoding or empty segments are accepted in the
+    path, so what authentication compares is exactly what the access log redacts.
+    The label may come from the path, an `X-MCP-Client` header, or a single `client` query
+    parameter; an invalid, repeated, or conflicting label raises RouteError instead of
+    silently falling back to the IP/User-Agent fingerprint.
+    """
+    path, _, query = str(raw_path or "").partition("?")
+    if "%" in path or not path.startswith("/"):
+        raise RouteError("malformed path")
+    segs = path[1:].split("/")
+    if len(segs) > 1 and segs[-1] == "":
+        segs = segs[:-1]  # tolerate one trailing slash
+    if not segs or segs[0] != prefix or any(x == "" for x in segs) or len(segs) > 3:
+        raise RouteError("unknown route")
+    tok = segs[1] if len(segs) >= 2 else ""
+    found: list[str] = []
+    if len(segs) == 3:
+        found.append(segs[2])
+    if headers is not None:
+        hv = headers.get_all("X-MCP-Client") if hasattr(headers, "get_all") else (
+            [headers.get("X-MCP-Client")] if headers.get("X-MCP-Client") is not None else None)
+        hv = [str(x).strip() for x in (hv or [])]
+        if len(hv) > 1:
+            raise RouteError("repeated X-MCP-Client header")
+        found.extend(hv)
+    if query:
+        qv = []
+        for kv in query.split("&"):
+            k, _, v = kv.partition("=")
+            if unquote(k) == "client":
+                qv.append(unquote(v).strip())
+        if len(qv) > 1:
+            raise RouteError("repeated client query parameter")
+        found.extend(qv)
+    labels = []
+    for cand in found:
+        if not LABEL_RE.fullmatch(cand):
+            raise RouteError("invalid client label")
+        labels.append(cand.lower())
+    if len(set(labels)) > 1:
+        raise RouteError("conflicting client labels")
+    return tok, (labels[0] if labels else "")
+
+
+def request_fingerprint(label: str, headers: Any, client_addr: str) -> tuple[str, str]:
+    """Fingerprint for sticky sessions: the label if given, else IP + User-Agent.
+
+    Forwarded-IP headers are trusted only when the TCP peer is loopback (a local tunnel such
+    as cloudflared); otherwise the socket address is used.
+    """
+    if label:
+        # No "|" in this encoding, so it can never equal an ip|ua fingerprint input.
+        return client_fingerprint("label\x00" + label), f"label={label}"
+    ip = str(client_addr or "")
+    if ip in LOOPBACK_ADDRS and headers is not None:
+        fwd = (headers.get("CF-Connecting-IP") or (headers.get("X-Forwarded-For") or "").split(",")[0]).strip()
+        ip = fwd or ip
+    ua = (headers.get("User-Agent") if headers is not None else "") or ""
+    ua = ua.strip()
+    return client_fingerprint(ip, ua), f"ip={ip} ua={ua[:120]}"
+
+
+def safe_log_line(command: str, path: str, code: Any) -> str:
+    """Access-log line without any path/query content (tokens can hide in odd encodings)."""
+    seg = str(path or "").lstrip("/").split("/", 1)[0].split("?", 1)[0]
+    route = seg if seg in {"mcp", "files", "health"} else "?"
+    return f"{time.strftime('%H:%M:%S')} {str(command or '')[:10]} /{route} {code}"
+
+
+TRIVIAL_SQL = (
+    "(steps <= 1 AND summary_count = 0 AND title = '' AND goal = '' AND next = '' AND notes = '' "
+    "AND done_json IN ('', '[]') AND blockers_json IN ('', '[]'))"
+)
+
+
+def _is_trivial_row(r: Any) -> bool:
+    return (
+        int(r["steps"] or 0) <= 1
+        and int(r["summary_count"] or 0) == 0
+        and not (r["title"] or r["goal"] or r["next"] or r["notes"])
+        and (r["done_json"] or "[]") == "[]"
+        and (r["blockers_json"] or "[]") == "[]"
+    )
 
 INSTRUCTIONS = (
     "This MCP server maintains a per-session black-box journal and an incremental summary file "
@@ -46,7 +156,10 @@ INSTRUCTIONS = (
     "Use `task_note` to set/update the overall title, goal, or mark status='done'. "
     "3) If the user asks you to continue an interrupted task, call `list_sessions` first and then "
     "`resume` with that `session_id` (attach=true by default) to read the session's incremental "
-    "summary file plus any recent unsummarized tool calls."
+    "summary file plus any recent unsummarized tool calls. "
+    "4) Sessions are sticky per client: clients that reconnect for every call keep landing in the same "
+    "session (idle window applies), and after `resume` all later calls from your client continue there. "
+    "Call `resume` with session_id='new' to start a fresh session."
 )
 
 JOURNAL_TOOLS: list[dict[str, Any]] = [
@@ -61,6 +174,7 @@ JOURNAL_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Max sessions to return (default 15)"},
                 "include_done": {"type": "boolean", "description": "Include sessions marked done (default false)"},
+                "include_trivial": {"type": "boolean", "description": "Include throwaway one-step sessions with no title/summary (default false)"},
             },
         },
     },
@@ -70,12 +184,13 @@ JOURNAL_TOOLS: list[dict[str, Any]] = [
             "Load a session's handoff state: its dedicated incremental summary markdown file, task note, "
             "touched files, and recent tool-call history (including any steps after the last summary). "
             "With attach=true (default on active sessions), subsequent tool calls and summaries from this "
-            "connection continue in that session. Pass reopen=true to re-activate a done session."
+            "client continue in that session, even across reconnects. Pass reopen=true to re-activate a done session. "
+            "Pass session_id='new' to detach and start a fresh session."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "session_id": {"type": "string", "description": "Target session_id; omit to resume the most recent non-empty active session"},
+                "session_id": {"type": "string", "description": "Target session_id; 'new' starts a fresh session; omit to resume the most recent meaningful active session"},
                 "last_n": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Number of recent tool calls to include (default 20)"},
                 "attach": {"type": "boolean", "description": "Bind current MCP connection to this session (default true)"},
                 "reopen": {"type": "boolean", "description": "If target session is done, reopen it to active before attaching (default false)"},
@@ -150,7 +265,11 @@ def sanitize_session_id(raw: str | None) -> str:
 
 
 def redact_url_path(path: str) -> str:
-    return re.sub(r"(/(?:mcp|files)/)[^/\s?]+", r"\1[REDACTED]", path or "")
+    # Drop everything after /mcp/ or /files/ (token, label, query); any percent-encoded or
+    # query-bearing path is redacted whole, since a token could hide in its encoding.
+    out = re.sub(r"(?i)\S*%[0-9a-f]{2}\S*", "[REDACTED]", path or "")
+    out = re.sub(r"(?i)(/(?:mcp|files)/)\S*", r"\1[REDACTED]", out)
+    return re.sub(r"\?\S*", "?[REDACTED]", out)
 
 
 def redact_text(text: str) -> str:
@@ -387,6 +506,17 @@ class SessionJournal:
                         target_sid TEXT NOT NULL,
                         updated_ts REAL NOT NULL
                     );
+                    CREATE TABLE IF NOT EXISTS client_fps (
+                        client_sid TEXT PRIMARY KEY,
+                        fp TEXT NOT NULL,
+                        info TEXT NOT NULL DEFAULT '',
+                        updated_ts REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS client_links (
+                        fp TEXT PRIMARY KEY,
+                        target_sid TEXT NOT NULL,
+                        updated_ts REAL NOT NULL
+                    );
                     """
                 )
                 cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
@@ -457,23 +587,143 @@ class SessionJournal:
             "last_ok": bool(row["last_ok"]),
         }
 
-    def _resolve_in_conn(self, conn: sqlite3.Connection, header_sid: str = "", arg_sid: str = "") -> str:
-        # Priority: explicit arg_sid > bound Mcp-Session-Id > raw Mcp-Session-Id > "default"
-        if arg_sid:
-            return sanitize_session_id(arg_sid)
-        if header_sid:
-            raw = sanitize_session_id(header_sid)
-            row = conn.execute("SELECT target_sid FROM bindings WHERE client_sid = ?", (raw,)).fetchone()
-            if row and row["target_sid"]:
-                return sanitize_session_id(row["target_sid"])
-            return raw
-        return "default"
+    @staticmethod
+    def _rollback(conn: sqlite3.Connection) -> None:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
 
-    def resolve_session_id(self, header_sid: str | None = None, arg_sid: str | None = None) -> str:
+    def register_client(self, client_sid: str, fp: str, info: str = "") -> None:
+        """Remember which client fingerprint opened this Mcp-Session-Id (called on initialize)."""
+        if not client_sid or not fp:
+            return
         with self._local_lock:
             conn = self._connect()
             try:
-                return self._resolve_in_conn(conn, header_sid or "", arg_sid or "")
+                conn.execute(
+                    """
+                    INSERT INTO client_fps (client_sid, fp, info, updated_ts) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(client_sid) DO UPDATE SET fp=excluded.fp, info=excluded.info, updated_ts=excluded.updated_ts
+                    """,
+                    (sanitize_session_id(client_sid), fp, redact_text(info)[:300], time.time()),
+                )
+            finally:
+                conn.close()
+
+    def _fp_for(self, conn: sqlite3.Connection, client_sid: str, fp: str = "") -> str:
+        if client_sid:
+            row = conn.execute("SELECT fp FROM client_fps WHERE client_sid = ?", (client_sid,)).fetchone()
+            if row and row["fp"]:
+                return row["fp"]
+        return fp or ""
+
+    def _active(self, conn: sqlite3.Connection, sid: str) -> bool:
+        row = conn.execute("SELECT status FROM sessions WHERE session_id = ?", (sid,)).fetchone()
+        return row is not None and row["status"] != "done"
+
+    def _touch_link(self, conn: sqlite3.Connection, fp: str, sid: str) -> None:
+        """Refresh this fingerprint's sticky link for an ordinary call.
+
+        A live link to a *different* active session (the client switched with `resume` /
+        `resume new` on another connection) is left alone, so an older connection cannot
+        silently switch the client back.
+        """
+        if not fp or not sid or sid == "default" or STICKY_SECONDS <= 0:
+            return
+        link = conn.execute("SELECT target_sid, updated_ts FROM client_links WHERE fp = ?", (fp,)).fetchone()
+        if (
+            link is not None
+            and link["target_sid"] != sid
+            and time.time() - float(link["updated_ts"]) <= STICKY_SECONDS
+            and self._active(conn, link["target_sid"])
+        ):
+            return
+        self._link_fp(conn, fp, sid)
+
+    def _link_fp(self, conn: sqlite3.Connection, fp: str, target: str) -> None:
+        if not fp or not target or STICKY_SECONDS <= 0:
+            return
+        conn.execute(
+            """
+            INSERT INTO client_links (fp, target_sid, updated_ts) VALUES (?, ?, ?)
+            ON CONFLICT(fp) DO UPDATE SET target_sid=excluded.target_sid, updated_ts=excluded.updated_ts
+            """,
+            (fp, target, time.time()),
+        )
+
+    def _bind(self, conn: sqlite3.Connection, client_sid: str, target: str) -> None:
+        if not client_sid:
+            return
+        if client_sid == target:
+            conn.execute("DELETE FROM bindings WHERE client_sid = ?", (client_sid,))
+            return
+        conn.execute(
+            """
+            INSERT INTO bindings (client_sid, target_sid, updated_ts) VALUES (?, ?, ?)
+            ON CONFLICT(client_sid) DO UPDATE SET target_sid=excluded.target_sid, updated_ts=excluded.updated_ts
+            """,
+            (client_sid, target, time.time()),
+        )
+
+    def _resolve_in_conn(self, conn: sqlite3.Connection, header_sid: str = "", arg_sid: str = "", fp: str = "") -> str:
+        # Priority: explicit arg_sid > bound Mcp-Session-Id (target still active) > sticky client
+        # link > raw Mcp-Session-Id (a fresh session if that one is done) > new session for a
+        # headerless client with a fingerprint > "default" (legacy anonymous callers).
+        if arg_sid:
+            return sanitize_session_id(arg_sid)
+        raw = sanitize_session_id(header_sid) if header_sid else ""
+        if raw:
+            row = conn.execute("SELECT target_sid FROM bindings WHERE client_sid = ?", (raw,)).fetchone()
+            if row and row["target_sid"]:
+                target = sanitize_session_id(row["target_sid"])
+                if self._active(conn, target):
+                    return target
+                # Target finished or pruned: the binding no longer routes anything.
+                conn.execute("DELETE FROM bindings WHERE client_sid = ?", (raw,))
+        fp = self._fp_for(conn, raw, fp)
+        if fp and STICKY_SECONDS > 0:
+            link = conn.execute("SELECT target_sid, updated_ts FROM client_links WHERE fp = ?", (fp,)).fetchone()
+            own = conn.execute("SELECT steps, status FROM sessions WHERE session_id = ?", (raw,)).fetchone() if raw else None
+            # A connection may follow the client's link if it has no history of its own yet,
+            # or its own session is finished.
+            fresh_conn = own is None or int(own["steps"] or 0) == 0 or own["status"] == "done"
+            if link and fresh_conn and link["target_sid"] != raw and time.time() - float(link["updated_ts"]) <= STICKY_SECONDS:
+                target = sanitize_session_id(link["target_sid"])
+                if self._active(conn, target):
+                    if raw:
+                        self._bind(conn, raw, target)
+                    return target
+        if raw:
+            if conn.execute("SELECT 1 FROM sessions WHERE session_id = ? AND status = 'done'", (raw,)).fetchone():
+                fresh = self.new_session_id()
+                self._bind(conn, raw, fresh)
+                return fresh
+            return raw
+        if fp and STICKY_SECONDS > 0:
+            return self.new_session_id()
+        return "default"
+
+    def resolve_session_id(self, header_sid: str | None = None, arg_sid: str | None = None, fp: str = "") -> str:
+        """Resolve the session a call belongs to, creating its row and refreshing the client's
+        sticky link in one IMMEDIATE transaction (safe across processes sharing the DB)."""
+        clean_header = sanitize_session_id(header_sid) if header_sid else ""
+        with self._local_lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                sid = self._resolve_in_conn(conn, clean_header, arg_sid or "", fp)
+                if sid != "default":
+                    self._ensure_session_row(conn, sid, self.source)
+                if clean_header:
+                    conn.execute("UPDATE client_fps SET updated_ts = ? WHERE client_sid = ?", (time.time(), clean_header))
+                # Explicit overrides (task_note on another session, _journal_session) must not
+                # re-point this client's sticky session.
+                if not arg_sid:
+                    self._touch_link(conn, self._fp_for(conn, clean_header, fp), sid)
+                conn.execute("COMMIT")
+                return sid
+            except Exception:
+                self._rollback(conn)
+                raise
             finally:
                 conn.close()
 
@@ -493,7 +743,10 @@ class SessionJournal:
                 conn.execute(f"DELETE FROM events WHERE session_id IN ({placeholders})", old_ids)
                 conn.execute(f"DELETE FROM sessions WHERE session_id IN ({placeholders})", old_ids)
                 conn.execute(f"DELETE FROM bindings WHERE target_sid IN ({placeholders})", old_ids)
+                conn.execute(f"DELETE FROM client_links WHERE target_sid IN ({placeholders})", old_ids)
                 self._delete_summary_files(old_ids)
+            conn.execute("DELETE FROM client_fps WHERE updated_ts < ?", (cutoff,))
+            conn.execute("DELETE FROM bindings WHERE updated_ts < ?", (cutoff,))
         # Keep total sessions bounded
         total = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
         if total > MAX_ACTIVE_SESSIONS:
@@ -509,7 +762,12 @@ class SessionJournal:
                 conn.execute(f"DELETE FROM events WHERE session_id IN ({placeholders})", drop_ids)
                 conn.execute(f"DELETE FROM sessions WHERE session_id IN ({placeholders})", drop_ids)
                 conn.execute(f"DELETE FROM bindings WHERE target_sid IN ({placeholders})", drop_ids)
+                conn.execute(f"DELETE FROM client_links WHERE target_sid IN ({placeholders})", drop_ids)
                 self._delete_summary_files(drop_ids)
+        # Sticky links are useless once their idle window has passed or their target is gone.
+        conn.execute("DELETE FROM client_links WHERE updated_ts < ?", (now - max(STICKY_SECONDS, 0),))
+        conn.execute("DELETE FROM client_links WHERE target_sid NOT IN (SELECT session_id FROM sessions)")
+        conn.execute("DELETE FROM bindings WHERE target_sid NOT IN (SELECT session_id FROM sessions)")
 
     def _ensure_session_row(self, conn: sqlite3.Connection, sid: str, source: str) -> sqlite3.Row:
         row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (sid,)).fetchone()
@@ -606,24 +864,24 @@ class SessionJournal:
                     )
                 return None
             except Exception:
-                conn.execute("ROLLBACK")
+                self._rollback(conn)
                 raise
             finally:
                 conn.close()
 
-    def list_sessions(self, *, limit: int = 15, include_done: bool = False) -> dict[str, Any]:
+    def list_sessions(self, *, limit: int = 15, include_done: bool = False, include_trivial: bool = False) -> dict[str, Any]:
         limit = max(1, min(int(limit or 15), 50))
         with self._local_lock:
             conn = self._connect()
             try:
-                if include_done:
-                    rows = conn.execute(
-                        "SELECT * FROM sessions ORDER BY updated_ts DESC LIMIT ?", (limit,)
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT * FROM sessions WHERE status != 'done' ORDER BY updated_ts DESC LIMIT ?", (limit,)
-                    ).fetchall()
+                where = "1=1" if include_done else "status != 'done'"
+                hidden = 0
+                if not include_trivial:
+                    hidden = conn.execute(f"SELECT COUNT(*) FROM sessions WHERE {where} AND {TRIVIAL_SQL}").fetchone()[0]
+                    where += f" AND NOT {TRIVIAL_SQL}"
+                rows = conn.execute(
+                    f"SELECT * FROM sessions WHERE {where} ORDER BY updated_ts DESC LIMIT ?", (limit,)
+                ).fetchall()
                 sessions = [
                     {
                         "session_id": r["session_id"],
@@ -640,7 +898,11 @@ class SessionJournal:
                     }
                     for r in rows
                 ]
-                return {"count": len(sessions), "sessions": sessions}
+                out = {"count": len(sessions), "sessions": sessions}
+                if hidden:
+                    out["hidden_trivial"] = hidden
+                    out["hint"] = "One-step untitled sessions are hidden; pass include_trivial=true to see them."
+                return out
             finally:
                 conn.close()
 
@@ -710,7 +972,7 @@ class SessionJournal:
                     "recorded_at_step": steps,
                 }
             except Exception:
-                conn.execute("ROLLBACK")
+                self._rollback(conn)
                 raise
             finally:
                 conn.close()
@@ -765,11 +1027,15 @@ class SessionJournal:
                         sid,
                     ),
                 )
+                if meta["status"] == "done":
+                    # A finished task stops attracting new calls via bindings or sticky links.
+                    conn.execute("DELETE FROM bindings WHERE target_sid = ?", (sid,))
+                    conn.execute("DELETE FROM client_links WHERE target_sid = ?", (sid,))
                 updated_row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (sid,)).fetchone()
                 conn.execute("COMMIT")
                 return {"ok": True, "session_id": sid, "meta": self._row_to_meta(updated_row)}
             except Exception:
-                conn.execute("ROLLBACK")
+                self._rollback(conn)
                 raise
             finally:
                 conn.close()
@@ -782,13 +1048,39 @@ class SessionJournal:
         last_n: int = 20,
         attach: bool = True,
         reopen: bool = False,
+        fp: str = "",
     ) -> dict[str, Any]:
         n = max(1, min(int(last_n or 20), 100))
         with self._local_lock:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                clean_client = sanitize_session_id(client_sid) if client_sid else ""
+                client_fp = self._fp_for(conn, clean_client, fp)
                 target_row = None
+                wants_new = bool(session_id) and session_id.strip().lower() in NEW_SESSION_WORDS
+                if wants_new and conn.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?", (session_id.strip(),)
+                ).fetchone():
+                    wants_new = False  # a legacy session literally named "new"/"fresh"/"none"
+                if wants_new:
+                    fresh = self.new_session_id()
+                    self._ensure_session_row(conn, fresh, self.source)
+                    can_bind = attach and (bool(clean_client) or (bool(client_fp) and STICKY_SECONDS > 0))
+                    if can_bind:
+                        if clean_client:
+                            self._bind(conn, clean_client, fresh)
+                        self._link_fp(conn, client_fp, fresh)
+                    conn.execute("COMMIT")
+                    out = {"found": True, "session_id": fresh, "attached": can_bind, "new": True}
+                    if can_bind:
+                        out["message"] = "Started a fresh session; later calls from this client go here."
+                    else:
+                        out["message"] = (
+                            "Created a fresh session but could not bind this client to it; "
+                            f"pass `{META_SESSION_KEY}`=\"{fresh}\" on later calls."
+                        )
+                    return out
                 if session_id:
                     target = sanitize_session_id(session_id)
                     target_row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (target,)).fetchone()
@@ -796,20 +1088,27 @@ class SessionJournal:
                         conn.execute("ROLLBACK")
                         return {"found": False, "session_id": target, "message": f"Session not found: {target}"}
                 else:
-                    # Find most recent non-empty active session (excluding caller's own brand-new sid)
+                    # Most recent meaningful active session (not a throwaway one-step session,
+                    # and not the caller's own brand-new sid); fall back to any non-empty one.
                     rows = conn.execute(
                         """
                         SELECT * FROM sessions
                         WHERE status != 'done'
-                          AND (steps > 0 OR summary_count > 0 OR title != '' OR goal != '' OR next != '' OR notes != '')
+                          AND (steps > 0 OR summary_count > 0 OR title != '' OR goal != '' OR next != '' OR notes != ''
+                               OR done_json NOT IN ('', '[]') OR blockers_json NOT IN ('', '[]'))
                         ORDER BY updated_ts DESC
-                        LIMIT 20
+                        LIMIT 300
                         """
                     ).fetchall()
                     for r in rows:
-                        if r["session_id"] != client_sid:
+                        if r["session_id"] != clean_client and not _is_trivial_row(r):
                             target_row = r
                             break
+                    if target_row is None:
+                        for r in rows:
+                            if r["session_id"] != clean_client:
+                                target_row = r
+                                break
                     if target_row is None and rows:
                         target_row = rows[0]
                     if target_row is None:
@@ -830,17 +1129,23 @@ class SessionJournal:
                         attach = False
                         note = "Session is marked done; opened read-only. Pass reopen=true to re-activate and attach."
 
-                if attach and client_sid:
-                    clean_client = sanitize_session_id(client_sid)
-                    if clean_client != target:
-                        conn.execute(
-                            """
-                            INSERT INTO bindings (client_sid, target_sid, updated_ts)
-                            VALUES (?, ?, ?)
-                            ON CONFLICT(client_sid) DO UPDATE SET target_sid=excluded.target_sid, updated_ts=excluded.updated_ts
-                            """,
-                            (clean_client, target, time.time()),
-                        )
+                if attach and (clean_client or (client_fp and STICKY_SECONDS > 0)):
+                    if clean_client:
+                        self._bind(conn, clean_client, target)
+                    # Sticky across reconnects: later connections from the same client land here too.
+                    self._link_fp(conn, client_fp, target)
+                    # Drop the caller's own empty placeholder session, if any (never one with
+                    # handoff data, a summary file, or a done status).
+                    if clean_client and clean_client != target:
+                        own = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (clean_client,)).fetchone()
+                        if (
+                            own is not None
+                            and int(own["steps"] or 0) == 0
+                            and own["status"] != "done"
+                            and _is_trivial_row(own)
+                            and not self._summary_path(clean_client).exists()
+                        ):
+                            conn.execute("DELETE FROM sessions WHERE session_id = ?", (clean_client,))
                     attached = True
 
                 ev_rows = conn.execute(
@@ -886,7 +1191,7 @@ class SessionJournal:
                     out["note"] = note
                 return out
             except Exception:
-                conn.execute("ROLLBACK")
+                self._rollback(conn)
                 raise
             finally:
                 conn.close()
@@ -898,11 +1203,13 @@ class SessionJournal:
         *,
         header_sid: str = "",
         session_override: str = "",
+        fp: str = "",
     ) -> dict[str, Any]:
         if tool_name == "list_sessions":
             return self.list_sessions(
                 limit=int(args.get("limit", 15) or 15),
                 include_done=bool(args.get("include_done", False)),
+                include_trivial=bool(args.get("include_trivial", False)),
             )
         if tool_name == "resume":
             sid_arg = str(args.get("session_id") or session_override or "").strip()
@@ -912,17 +1219,25 @@ class SessionJournal:
                 last_n=int(args.get("last_n", 20) or 20),
                 attach=bool(args.get("attach", True)),
                 reopen=bool(args.get("reopen", False)),
+                fp=fp,
             )
         if tool_name == "append_summary":
+            if not str(args.get("summary") or "").strip():
+                raise ValueError("summary is required and cannot be empty")
             sid_arg = str(args.get("session_id") or session_override or "").strip()
-            resolved = self.resolve_session_id(header_sid=header_sid, arg_sid=sid_arg)
+            resolved = self.resolve_session_id(header_sid=header_sid, arg_sid=sid_arg, fp=fp)
             return self.append_summary(
                 resolved,
                 str(args.get("summary") or ""),
                 next_step=str(args.get("next_step") or ""),
             )
         if tool_name == "task_note":
+            if not any(
+                k in args and args[k] is not None
+                for k in ("title", "goal", "next", "notes", "done", "add_done", "blockers", "status")
+            ):
+                raise ValueError("at least one field (title, goal, done, add_done, blockers, next, notes, status) is required")
             sid_arg = str(args.get("session_id") or session_override or "").strip()
-            resolved = self.resolve_session_id(header_sid=header_sid, arg_sid=sid_arg)
+            resolved = self.resolve_session_id(header_sid=header_sid, arg_sid=sid_arg, fp=fp)
             return self.update_task_note(resolved, args)
         raise ValueError(f"unknown journal tool: {tool_name}")
